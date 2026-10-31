@@ -70,6 +70,8 @@ def main():
                 "role": role,
             })
 
+        down_count = 0
+
         for interface in device.findall("interface"):
             status = interface.get("status")
 
@@ -77,8 +79,19 @@ def main():
                 interfaces["up"] += 1
             elif status == "down":
                 interfaces["down"] += 1
+                down_count += 1
             else: 
                 interfaces["other"] += 1
+        
+        if (
+            "max_down_interfaces" in policy
+            and down_count > policy["max_down_interfaces"]
+        ):
+            violations.append({
+                "device": device_id,
+                "type": "too_many_down",
+                "down":  down_count,
+            })
 
     print("Kept devices:", kept)
     print("Skipped devices:", skipped)
