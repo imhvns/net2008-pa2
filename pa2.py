@@ -3,6 +3,7 @@
 # NET2008 Practical Assessment 2 - Fleet Compliance Auditor
 
 import sys
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -29,6 +30,8 @@ def main():
 
     kept = 0
     skipped = 0
+    roles = {}
+    interfaces = {"up": 0, "down": 0, "other": 0}
 
     for device in root.findall("device"):
         device_id = device.get("id")
@@ -39,8 +42,37 @@ def main():
         kept += 1
         print(device_id)
 
+        role = device.get("role", "unknown")
+        roles[role] = roles.get(role, 0) + 1
+
+        for interface in device.findall("interface"):
+            status = interface.get("status")
+
+            if status == "up":
+                interfaces["up"] += 1
+            elif status == "down":
+                interfaces["down"] += 1
+            else: 
+                interfaces["other"] += 1
+
     print("Kept devices:", kept)
     print("Skipped devices:", skipped)
+    print("Roles:", roles)
+    print("Interfaces:", interfaces)
+
+    report = {
+        "site": root.get("site"),
+        "total_devices": kept,
+        "skipped_devices": skipped,
+        "roles": roles,
+        "interfaces": interfaces,
+        "violations": [],
+        "compliant": [],
+    }
+
+    with open("audit.json", "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=2)
+
     return 0
 
 if __name__ == "__main__":
