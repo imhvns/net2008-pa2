@@ -4,6 +4,7 @@
 
 import sys
 import json
+import yaml
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -12,6 +13,11 @@ def read_inventory(xml_file):
     tree = ET.parse(xml_file)
     return tree.getroot()
 
+def read_policy(policy_file):
+    """Read the YAML policy and return its contents."""
+    with open(policy_file, encoding="utf-8") as policy_stream:
+        return yaml.safe_load(policy_stream)
+    
 def main():
     """Read the inventory and print the IDs of kept devices."""
     if len(sys.argv) != 3:
@@ -19,11 +25,13 @@ def main():
         return 2
 
     xml_file = Path(sys.argv[1])
+    policy_file = Path(sys.argv[2])
 
     try:
         root = read_inventory(xml_file)
-    except (OSError, ET.ParseError) as error:
-        print (f"Error reading {xml_file.name}: {error}")
+        policy = read_policy(policy_file)
+    except (OSError, ET.ParseError, yaml.YAMLError) as error:
+        print (f"Error reading an input file: {error}")
         return 1
 
     print("Site:", root.get("site"))
@@ -32,6 +40,7 @@ def main():
     skipped = 0
     roles = {}
     interfaces = {"up": 0, "down": 0, "other": 0}
+    violations = []
 
     for device in root.findall("device"):
         device_id = device.get("id")
@@ -41,6 +50,15 @@ def main():
             continue
         kept += 1
         print(device_id)
+
+        if policy.get("require_owner", False):
+            owner = device.findtext("owner")
+
+            if not owner or not owner.strip():
+                violations.append({
+                    "device": device_id,
+                    "type": "missing_owner",
+                })
 
         role = device.get("role", "unknown")
         roles[role] = roles.get(role, 0) + 1
@@ -66,7 +84,7 @@ def main():
         "skipped_devices": skipped,
         "roles": roles,
         "interfaces": interfaces,
-        "violations": [],
+        "violations": violations,
         "compliant": [],
     }
 
