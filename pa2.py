@@ -62,6 +62,13 @@ def main():
 
         role = device.get("role", "unknown")
         roles[role] = roles.get(role, 0) + 1
+        
+        if "min_os" in policy and role not in policy["min_os"]:
+            violations.append({
+                "device": device_id,
+                "type": "unknown_role",
+                "role": role,
+            })
 
         for interface in device.findall("interface"):
             status = interface.get("status")
