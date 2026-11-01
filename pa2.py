@@ -10,17 +10,97 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
+# ---------- Custom exception ----------
+class AuditInputError(Exception):
+    """Represent an input-file or policy error the program can report."""
+
+
+# ---------- Device class ----------
+class Device:
+    """Represent one device that has an ID in the inventory."""
+
+    def __init__(self, element):
+        """Read the device details from its XML element."""
+        self.id = element.get("id")
+        self.role = element.get("role", "unknown")
+        self.os_version = element.get("os")
+        self.owner = element.findtext("owner")
+        self.interfaces = element.findall("interface")
+
+    def has_owner(self):
+        """Return True when the device has a non-empty owner."""
+        return bool(self.owner and self.owner.strip())
+
+    def interface_status_counts(self):
+        """Count this device's interfaces by status."""
+        counts = {"up": 0, "down": 0, "other": 0}
+
+        for interface in self.interfaces:
+            status = interface.get("status")
+
+            if status == "up":
+                counts["up"] += 1
+            elif status == "down":
+                counts["down"] += 1
+            else:
+                counts["other"] += 1
+
+        return counts
+
+
 # ---------- Input-reading functions ----------
 def read_inventory(xml_file):
     """Read the XML inventory and return its root element."""
-    tree = ET.parse(xml_file)
+    try:
+        tree = ET.parse(xml_file)
+    except (OSError, ET.ParseError) as error:
+        raise AuditInputError(
+            f"Error reading {xml_file.name}: {error}"
+        ) from error
+
     return tree.getroot()
 
 
 def read_policy(policy_file):
-    """Read the YAML policy and return its contents."""
-    with open(policy_file, encoding="utf-8") as policy_stream:
-        return yaml.safe_load(policy_stream)
+    """Read and validate the YAML policy mapping."""
+    try:
+        with open(policy_file, encoding="utf-8") as policy_stream:
+            policy = yaml.safe_load(policy_stream)
+    except (OSError, yaml.YAMLError) as error:
+        raise AuditInputError(
+            f"Error reading {policy_file.name}: {error}"
+        ) from error
+
+    # An empty YAML file is a valid empty policy.
+    if policy is None:
+        return {}
+
+    if not isinstance(policy, dict):
+        raise AuditInputError(
+            f"Error reading {policy_file.name}: policy must be a YAML mapping"
+        )
+
+    if "min_os" in policy and not isinstance(policy["min_os"], dict):
+        raise AuditInputError(
+            f"Error reading {policy_file.name}: min_os must be a mapping"
+        )
+
+    if "require_owner" in policy and not isinstance(
+        policy["require_owner"], bool
+    ):
+        raise AuditInputError(
+            f"Error reading {policy_file.name}: require_owner must be true or false"
+        )
+
+    if "max_down_interfaces" in policy:
+        limit = policy["max_down_interfaces"]
+        if type(limit) is not int or limit < 0:
+            raise AuditInputError(
+                f"Error reading {policy_file.name}: "
+                "max_down_interfaces must be a non-negative whole number"
+            )
+
+    return policy
 
 
 # ---------- Version comparison ----------
@@ -29,6 +109,7 @@ def version_is_outdated(found, required):
     found_parts = [int(part) for part in found.split(".")]
     required_parts = [int(part) for part in required.split(".")]
 
+    # Treat missing trailing parts as zero: 9.1 equals 9.1.0.
     width = max(len(found_parts), len(required_parts))
     found_parts += [0] * (width - len(found_parts))
     required_parts += [0] * (width - len(required_parts))
@@ -38,7 +119,7 @@ def version_is_outdated(found, required):
 
 # ---------- Main program ----------
 def main():
-    """Read the input files, check devices, and write the audit report."""
+    """Read the files, audit devices, and write the JSON report."""
 
     # ---------- Command-line arguments ----------
     if len(sys.argv) != 3:
@@ -48,126 +129,88 @@ def main():
     xml_file = Path(sys.argv[1])
     policy_file = Path(sys.argv[2])
 
-    # ---------- Read and validate the XML inventory ----------
+    # ---------- Read input files ----------
     try:
         root = read_inventory(xml_file)
-    except (OSError, ET.ParseError) as error:
-        print(f"Error reading {xml_file.name}: {error}")
-        return 1
-
-    # ---------- Read and validate the YAML policy ----------
-    try:
         policy = read_policy(policy_file)
-    except (OSError, yaml.YAMLError) as error:
-        print(f"Error reading {policy_file.name}: {error}")
+    except AuditInputError as error:
+        print(error)
         return 1
 
-    # Treat an empty YAML file as an empty policy.
-    if policy is None:
-        policy = {}
-
-    if not isinstance(policy, dict):
-        print(f"Error reading {policy_file.name}: policy must be a YAML mapping")
-        return 1
-
-    # ---------- Initialize report counts ----------
-    print("Site:", root.get("site"))
-
+    # ---------- Initialize report data ----------
     kept = 0
     skipped = 0
     roles = {}
     interfaces = {"up": 0, "down": 0, "other": 0}
     violations = []
+    kept_devices = []
+
+    min_os = policy.get("min_os")
+    require_owner = policy.get("require_owner", False)
+    max_down = policy.get("max_down_interfaces")
 
     # ---------- Check each device ----------
-    for device in root.findall("device"):
-        device_id = device.get("id")
+    for element in root.findall("device"):
+        device_id = element.get("id")
 
-        # Skip devices that do not have an ID.
         if not device_id:
             skipped += 1
             continue
 
+        device = Device(element)
+        kept_devices.append(device)
         kept += 1
-        print(device_id)
 
-        # Check whether the device has an owner.
-        if policy.get("require_owner", False):
-            owner = device.findtext("owner")
+        roles[device.role] = roles.get(device.role, 0) + 1
 
-            if not owner or not owner.strip():
-                violations.append({
-                    "device": device_id,
-                    "type": "missing_owner",
-                })
-
-        # Count the device's role.
-        role = device.get("role", "unknown")
-        roles[role] = roles.get(role, 0) + 1
-
-        # Check whether the role is allowed by the policy.
-        min_os = policy.get("min_os", {})
-
-        if "min_os" in policy and role not in min_os:
+        # Check owner when the policy includes that rule.
+        if require_owner and not device.has_owner():
             violations.append({
-                "device": device_id,
-                "type": "unknown_role",
-                "role": role,
+                "device": device.id,
+                "type": "missing_owner",
             })
 
-        # Check the OS version for roles listed in min_os.
-        if role in min_os:
-            found = device.get("os")
-            required = min_os[role]
-
-            if version_is_outdated(found, required):
+        # Check allowed roles and OS versions when min_os is in the policy.
+        if min_os is not None:
+            if device.role not in min_os:
                 violations.append({
-                    "device": device_id,
+                    "device": device.id,
+                    "type": "unknown_role",
+                    "role": device.role,
+                })
+            elif version_is_outdated(
+                device.os_version,
+                min_os[device.role],
+            ):
+                violations.append({
+                    "device": device.id,
                     "type": "os_outdated",
-                    "found": found,
-                    "required": required,
+                    "found": device.os_version,
+                    "required": min_os[device.role],
                 })
 
-        # Count interface statuses and this device's down interfaces.
-        down_count = 0
+        # Count interfaces and check the per-device down limit.
+        device_interfaces = device.interface_status_counts()
 
-        for interface in device.findall("interface"):
-            status = interface.get("status")
+        for status in interfaces:
+            interfaces[status] += device_interfaces[status]
 
-            if status == "up":
-                interfaces["up"] += 1
-            elif status == "down":
-                interfaces["down"] += 1
-                down_count += 1
-            else:
-                interfaces["other"] += 1
-
-        # Check whether this device exceeds the down-interface limit.
-        if (
-            "max_down_interfaces" in policy
-            and down_count > policy["max_down_interfaces"]
-        ):
+        if max_down is not None and device_interfaces["down"] > max_down:
             violations.append({
-                "device": device_id,
+                "device": device.id,
                 "type": "too_many_down",
-                "down": down_count,
+                "down": device_interfaces["down"],
             })
 
     # ---------- Find compliant devices ----------
     violating_ids = {violation["device"] for violation in violations}
     compliant = sorted(
-        device.get("id")
-        for device in root.findall("device")
-        if device.get("id") and device.get("id") not in violating_ids
+        device.id
+        for device in kept_devices
+        if device.id not in violating_ids
     )
 
-    # ---------- Print summary ----------
-    print("Kept devices:", kept)
-    print("Skipped devices:", skipped)
-    print("Roles:", roles)
-    print("Interfaces:", interfaces)
-
-    # ---------- Build and write JSON report ----------
+    # ---------- Build and write the report ----------
     report = {
         "site": root.get("site"),
         "total_devices": kept,
@@ -180,6 +223,13 @@ def main():
 
     with open("audit.json", "w", encoding="utf-8") as report_file:
         json.dump(report, report_file, indent=2)
+
+    # ---------- Print a short summary ----------
+    print("Site:", root.get("site"))
+    print("Kept devices:", kept)
+    print("Skipped devices:", skipped)
+    print("Roles:", roles)
+    print("Interfaces:", interfaces)
 
     return 0
 
